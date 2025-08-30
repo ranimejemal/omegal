@@ -9,20 +9,21 @@ import { v4 as uuidv4 } from 'uuid';
 const app = express();
 const server = http.createServer(app);
 
-// Security middleware
+// 🔒 Security middleware
 app.use(helmet());
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' ? false : '*',
   credentials: true
 }));
 
-// Rate limiting
+// 🚨 Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  max: 100
 });
 app.use(limiter);
 
+// 🔌 Socket.IO Setup
 const io = new Server(server, {
   cors: {
     origin: process.env.NODE_ENV === 'production' ? false : '*',
@@ -30,14 +31,14 @@ const io = new Server(server, {
   }
 });
 
-// Store for active users and chat rooms
-const activeUsers = new Map();
-const waitingUsers = [];
-const premiumWaitingUsers = [];
-const chatRooms = new Map();
+// 🔹 Data stores
+const activeUsers = new Map();  // socketId -> user object
+const waitingUsers = [];        // normal queue
+const premiumWaitingUsers = []; // premium queue
+const chatRooms = new Map();    // roomId -> room object
 
-// Profanity filter - basic implementation
-const bannedWords = ['spam', 'abuse', 'inappropriate']; // Add more as needed
+// 🚫 Profanity filter
+const bannedWords = ['spam', 'abuse', 'inappropriate'];
 const filterMessage = (message) => {
   let filtered = message;
   bannedWords.forEach(word => {
@@ -47,68 +48,53 @@ const filterMessage = (message) => {
   return filtered;
 };
 
-// Generate room ID
+// 🎲 Utility functions
 const generateRoomId = () => uuidv4();
 
-// Find a match for user
 const findMatch = (userId, preferences = null) => {
-  let targetQueue = waitingUsers;
-  
-  // If user has premium preferences, try premium queue first
-  if (preferences) {
-    targetQueue = premiumWaitingUsers;
-    
-    // Find matching user with compatible preferences
-    const matchIndex = targetQueue.findIndex(waitingUser => {
-      if (waitingUser.id === userId) return false;
-      
-      // Check if preferences are compatible
-      const userPrefs = preferences;
-      const waitingPrefs = waitingUser.preferences;
-      
-      if (!userPrefs || !waitingPrefs) return true; // If either has no preferences, match
-      
-      // Check gender compatibility
-      if (userPrefs.gender && userPrefs.gender !== 'Any' && 
-          waitingPrefs.gender && waitingPrefs.gender !== 'Any' &&
-          userPrefs.gender !== waitingPrefs.gender) return false;
-          
-      // Check nationality compatibility  
-      if (userPrefs.nationality && userPrefs.nationality !== 'Any' &&
-          waitingPrefs.nationality && waitingPrefs.nationality !== 'Any' &&
-          userPrefs.nationality !== waitingPrefs.nationality) return false;
-          
-      // Check country compatibility
-      if (userPrefs.country && userPrefs.country !== 'Any' &&
-          waitingPrefs.country && waitingPrefs.country !== 'Any' &&
-          userPrefs.country !== waitingPrefs.country) return false;
-          
-      return true;
-    });
-    
-    if (matchIndex !== -1) {
-      const match = targetQueue[matchIndex];
-      targetQueue.splice(matchIndex, 1);
-      return match.id;
-    }
-  }
-  
-  // Fall back to regular queue
-  const matchIndex = waitingUsers.findIndex(waitingUser => {
-    return (typeof waitingUser === 'string' ? waitingUser : waitingUser.id) !== userId;
+  let targetQueue = preferences ? premiumWaitingUsers : waitingUsers;
+
+  // Try matching in the selected queue
+  const matchIndex = targetQueue.findIndex(u => {
+    const waitingUser = typeof u === 'string' ? { id: u } : u;
+    if (waitingUser.id === userId) return false;
+
+    if (!preferences || !waitingUser.preferences) return true;
+
+    // Gender check
+    if (
+      preferences.gender && preferences.gender !== 'Any' &&
+      waitingUser.preferences?.gender && waitingUser.preferences.gender !== 'Any' &&
+      preferences.gender !== waitingUser.preferences.gender
+    ) return false;
+
+    // Nationality check
+    if (
+      preferences.nationality && preferences.nationality !== 'Any' &&
+      waitingUser.preferences?.nationality && waitingUser.preferences.nationality !== 'Any' &&
+      preferences.nationality !== waitingUser.preferences.nationality
+    ) return false;
+
+    // Country check
+    if (
+      preferences.country && preferences.country !== 'Any' &&
+      waitingUser.preferences?.country && waitingUser.preferences.country !== 'Any' &&
+      preferences.country !== waitingUser.preferences.country
+    ) return false;
+
+    return true;
   });
-  
+
   if (matchIndex === -1) return null;
-  
-  const match = waitingUsers[matchIndex];
-  waitingUsers.splice(matchIndex, 1);
+  const match = targetQueue.splice(matchIndex, 1)[0];
   return typeof match === 'string' ? match : match.id;
 };
 
+// 🖥️ Socket.IO logic
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
-  
-  // Store user info
+  console.log(`User connected: ${socket.id}`);
+
+  // Register new user
   activeUsers.set(socket.id, {
     id: socket.id,
     connectedAt: new Date(),
@@ -116,7 +102,7 @@ io.on('connection', (socket) => {
     isSearching: false
   });
 
-  // Handle finding a chat partner
+  // 🔍 Find a chat partner
   socket.on('findPartner', (data = {}) => {
     const user = activeUsers.get(socket.id);
     if (!user || user.roomId) return;
@@ -125,241 +111,148 @@ io.on('connection', (socket) => {
     const matchId = findMatch(socket.id, data.premiumPreferences);
 
     if (matchId && activeUsers.has(matchId)) {
-      // Create new chat room
       const roomId = generateRoomId();
       const matchUser = activeUsers.get(matchId);
 
-      // Update both users
-      user.roomId = roomId;
-      user.isSearching = false;
-      matchUser.roomId = roomId;
-      matchUser.isSearching = false;
+      // Update users
+      user.roomId = matchUser.roomId = roomId;
+      user.isSearching = matchUser.isSearching = false;
 
-      // Join both users to the room
+      // Join room
       socket.join(roomId);
       io.sockets.sockets.get(matchId)?.join(roomId);
 
-      // Store room info
+      // Save room
       chatRooms.set(roomId, {
         users: [socket.id, matchId],
         createdAt: new Date(),
         messages: []
       });
 
-      // Notify both users
       io.to(roomId).emit('partnerFound', { roomId });
-      
-      console.log(`Match found: ${socket.id} and ${matchId} in room ${roomId}`);
+      console.log(`Match: ${socket.id} ↔ ${matchId} in ${roomId}`);
     } else {
-      // Add to waiting queue
-      const waitingUser = {
-        id: socket.id,
-        preferences: data.premiumPreferences
-      };
-      
+      const waitingUser = { id: socket.id, preferences: data.premiumPreferences };
       if (data.premiumPreferences) {
-        if (!premiumWaitingUsers.find(u => u.id === socket.id)) {
-          premiumWaitingUsers.push(waitingUser);
-        }
+        if (!premiumWaitingUsers.find(u => u.id === socket.id)) premiumWaitingUsers.push(waitingUser);
       } else {
-        if (!waitingUsers.find(u => (typeof u === 'string' ? u : u.id) === socket.id)) {
-          waitingUsers.push(socket.id);
-        }
+        if (!waitingUsers.includes(socket.id)) waitingUsers.push(socket.id);
       }
       socket.emit('searching');
     }
   });
 
-  // Handle text messages
+  // 💬 Messaging
   socket.on('sendMessage', (data) => {
     const user = activeUsers.get(socket.id);
-    if (!user || !user.roomId) return;
+    if (!user?.roomId) return;
 
     const room = chatRooms.get(user.roomId);
     if (!room) return;
 
-    // Filter message for inappropriate content
-    const filteredMessage = filterMessage(data.message);
-    
     const messageData = {
       id: uuidv4(),
-      message: filteredMessage,
+      message: filterMessage(data.message),
       timestamp: new Date().toISOString(),
       senderId: socket.id
     };
 
-    // Store message in room
     room.messages.push(messageData);
-
-    // Send to other user in room
     socket.to(user.roomId).emit('messageReceived', messageData);
   });
 
-  // Handle video chat requests
-  socket.on('videoRequest', () => {
-    const user = activeUsers.get(socket.id);
-    if (!user || !user.roomId) return;
+  // 🎥 Video signaling
+  socket.on('videoRequest', () => forwardEvent(socket, 'videoRequest', { from: socket.id }));
+  socket.on('videoRequestResponse', (data) => forwardEvent(socket, data.accepted ? 'videoRequestAccepted' : 'videoRequestRejected'));
+  socket.on('videoOffer', (data) => forwardEvent(socket, 'videoOffer', { offer: data.offer, senderId: socket.id }));
+  socket.on('videoAnswer', (data) => forwardEvent(socket, 'videoAnswer', { answer: data.answer, senderId: socket.id }));
+  socket.on('iceCandidate', (data) => forwardEvent(socket, 'iceCandidate', { candidate: data.candidate, senderId: socket.id }));
 
-    socket.to(user.roomId).emit('videoRequest', { from: socket.id });
-  });
+  // 🛑 Leave chat
+  socket.on('leaveChat', () => leaveChat(socket));
 
-  socket.on('videoRequestResponse', (data) => {
-    const user = activeUsers.get(socket.id);
-    if (!user || !user.roomId) return;
-
-    if (data.accepted) {
-      socket.to(user.roomId).emit('videoRequestAccepted');
-    } else {
-      socket.to(user.roomId).emit('videoRequestRejected');
-    }
-  });
-
-  // Handle video chat signaling
-  socket.on('videoOffer', (data) => {
-    const user = activeUsers.get(socket.id);
-    if (!user || !user.roomId) return;
-
-    socket.to(user.roomId).emit('videoOffer', {
-      offer: data.offer,
-      senderId: socket.id
-    });
-  });
-
-  socket.on('videoAnswer', (data) => {
-    const user = activeUsers.get(socket.id);
-    if (!user || !user.roomId) return;
-
-    socket.to(user.roomId).emit('videoAnswer', {
-      answer: data.answer,
-      senderId: socket.id
-    });
-  });
-
-  socket.on('iceCandidate', (data) => {
-    const user = activeUsers.get(socket.id);
-    if (!user || !user.roomId) return;
-
-    socket.to(user.roomId).emit('iceCandidate', {
-      candidate: data.candidate,
-      senderId: socket.id
-    });
-  });
-
-  // Handle disconnection from current chat
-  socket.on('disconnect', () => {
-    handleDisconnection(socket.id);
-  });
-
-  socket.on('leaveChat', () => {
-    const user = activeUsers.get(socket.id);
-    if (user && user.roomId) {
-      // Notify partner
-      socket.to(user.roomId).emit('partnerLeft');
-      
-      // Clean up room
-      cleanupRoom(user.roomId, socket.id);
-    }
-    
-    // Reset user state
-    if (user) {
-      user.roomId = null;
-      user.isSearching = false;
-    }
-
-    // Remove from waiting queue
-    const waitingIndex = waitingUsers.findIndex(u => (typeof u === 'string' ? u : u.id) === socket.id);
-    if (waitingIndex > -1) {
-      waitingUsers.splice(waitingIndex, 1);
-    }
-    
-    const premiumWaitingIndex = premiumWaitingUsers.findIndex(u => u.id === socket.id);
-    if (premiumWaitingIndex > -1) {
-      premiumWaitingUsers.splice(premiumWaitingIndex, 1);
-    }
-
-    socket.emit('chatEnded');
-  });
+  // ❌ Disconnect
+  socket.on('disconnect', () => handleDisconnection(socket.id));
 });
 
-// Clean up functions
-const cleanupRoom = (roomId, leavingUserId) => {
+// 🔁 Forward helper
+function forwardEvent(socket, event, payload) {
+  const user = activeUsers.get(socket.id);
+  if (user?.roomId) socket.to(user.roomId).emit(event, payload);
+}
+
+// 🚪 Leave chat
+function leaveChat(socket) {
+  const user = activeUsers.get(socket.id);
+  if (!user) return;
+
+  if (user.roomId) {
+    socket.to(user.roomId).emit('partnerLeft');
+    cleanupRoom(user.roomId, socket.id);
+  }
+
+  user.roomId = null;
+  user.isSearching = false;
+  removeFromQueues(socket.id);
+  socket.emit('chatEnded');
+}
+
+// 🧹 Cleanup helpers
+function cleanupRoom(roomId, leavingUserId) {
   const room = chatRooms.get(roomId);
   if (!room) return;
 
-  // Update remaining user
-  const remainingUserId = room.users.find(id => id !== leavingUserId);
-  if (remainingUserId && activeUsers.has(remainingUserId)) {
-    const remainingUser = activeUsers.get(remainingUserId);
-    remainingUser.roomId = null;
-    remainingUser.isSearching = false;
-    
-    // Leave the room
-    const remainingSocket = io.sockets.sockets.get(remainingUserId);
-    if (remainingSocket) {
-      remainingSocket.leave(roomId);
-    }
+  const partnerId = room.users.find(id => id !== leavingUserId);
+  if (partnerId && activeUsers.has(partnerId)) {
+    const partner = activeUsers.get(partnerId);
+    partner.roomId = null;
+    partner.isSearching = false;
+    io.sockets.sockets.get(partnerId)?.leave(roomId);
   }
 
-  // Delete room
   chatRooms.delete(roomId);
-};
+}
 
-const handleDisconnection = (socketId) => {
-  console.log('User disconnected:', socketId);
-  
+function removeFromQueues(userId) {
+  const remove = (arr) => {
+    const idx = arr.findIndex(u => (typeof u === 'string' ? u : u.id) === userId);
+    if (idx !== -1) arr.splice(idx, 1);
+  };
+  remove(waitingUsers);
+  remove(premiumWaitingUsers);
+}
+
+function handleDisconnection(socketId) {
+  console.log(`User disconnected: ${socketId}`);
   const user = activeUsers.get(socketId);
-  if (user) {
-    // Clean up room if user was in one
-    if (user.roomId) {
-      const room = chatRooms.get(user.roomId);
-      if (room) {
-        // Notify partner
-        const partnerId = room.users.find(id => id !== socketId);
-        if (partnerId) {
-          io.to(partnerId).emit('partnerLeft');
-        }
-        cleanupRoom(user.roomId, socketId);
-      }
-    }
+  if (!user) return;
 
-    // Remove from waiting queue
-    const waitingIndex = waitingUsers.findIndex(u => (typeof u === 'string' ? u : u.id) === socketId);
-    if (waitingIndex > -1) {
-      waitingUsers.splice(waitingIndex, 1);
-    }
-    
-    const premiumWaitingIndex = premiumWaitingUsers.findIndex(u => u.id === socketId);
-    if (premiumWaitingIndex > -1) {
-      premiumWaitingUsers.splice(premiumWaitingIndex, 1);
-    }
-
-    // Remove user
-    activeUsers.delete(socketId);
+  if (user.roomId) {
+    const partnerId = chatRooms.get(user.roomId)?.users.find(id => id !== socketId);
+    if (partnerId) io.to(partnerId).emit('partnerLeft');
+    cleanupRoom(user.roomId, socketId);
   }
-};
 
+  removeFromQueues(socketId);
+  activeUsers.delete(socketId);
+}
+
+// 🌐 Start server
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
-// Broadcast user counts every 5 seconds
+// 📊 User stats
 setInterval(() => {
-  const counts = {
+  io.emit('userCounts', {
     matching: waitingUsers.length + premiumWaitingUsers.length,
     connected: activeUsers.size - waitingUsers.length - premiumWaitingUsers.length
-  };
-  
-  io.emit('userCounts', counts);
+  });
 }, 5000);
 
-// Cleanup intervals
+// 🧹 Room cleanup
 setInterval(() => {
-  // Remove stale rooms (older than 1 hour with no activity)
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
   for (const [roomId, room] of chatRooms) {
-    if (room.createdAt < oneHourAgo) {
-      cleanupRoom(roomId, null);
-    }
+    if (room.createdAt < oneHourAgo) cleanupRoom(roomId, null);
   }
-}, 10 * 60 * 1000); // Run every 10 minutes
+}, 10 * 60 * 1000);
